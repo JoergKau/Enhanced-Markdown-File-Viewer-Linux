@@ -57,7 +57,7 @@
 > [!NOTE] Technical
 > - Rust 2024 · eframe/egui 0.37 · wgpu (Vulkan) · winit 0.30 ·
 >   pulldown-cmark 0.13 · Linux x86_64.
-> - 181 unit/integration tests plus an ignored deep render pass; zero build,
+> - 182 unit/integration tests plus an ignored deep render pass; zero build,
 >   clippy and rustfmt warnings.
 > - User-local desktop integration through `build.sh --install`
 >   (`~/.local/bin`, `.desktop` entry, hicolor icons) and a zipped x86_64

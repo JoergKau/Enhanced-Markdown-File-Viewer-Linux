@@ -1703,9 +1703,7 @@ impl App {
                         // About panel (Linux equivalent of the macOS About
                         // window): icon, version, credits and license.
                         if ui
-                            .add(egui::Button::new(
-                                RichText::new("ⓘ").size(15.0),
-                            ))
+                            .add(egui::Button::new(RichText::new("ⓘ").size(15.0)))
                             .on_hover_text("About MD-Viewer")
                             .clicked()
                         {
@@ -2498,12 +2496,10 @@ impl App {
                     // App icon (the embedded 256 px master, cached as texture).
                     let icon = app_icon_texture(ui.ctx());
                     ui.add_space(6.0);
-                    ui.add(
-                        egui::Image::from_texture(egui::load::SizedTexture::new(
-                            icon.id(),
-                            Vec2::splat(72.0),
-                        )),
-                    );
+                    ui.add(egui::Image::from_texture(egui::load::SizedTexture::new(
+                        icon.id(),
+                        Vec2::splat(72.0),
+                    )));
                     ui.add_space(10.0);
                     ui.label(
                         RichText::new("MD-Viewer")
@@ -2517,12 +2513,10 @@ impl App {
                     );
                     ui.add_space(6.0);
                     ui.label(
-                        RichText::new(
-                            "A native Markdown editor and viewer for Ubuntu Linux.",
-                        )
-                        .size(14.0)
-                        .color(palette().text)
-                        .line_height(Some(20.0)),
+                        RichText::new("A native Markdown editor and viewer for Ubuntu Linux.")
+                            .size(14.0)
+                            .color(palette().text)
+                            .line_height(Some(20.0)),
                     );
                     ui.add_space(4.0);
                     ui.label(
@@ -7242,25 +7236,27 @@ fn modal_frame() -> Frame {
 
 /// The embedded app icon as an egui texture, decoded and cached once per
 /// context (used by the About panel).
+///
+/// The texture is loaded *outside* the `data_mut` closure on purpose:
+/// `load_texture` itself takes the context lock, so calling it while
+/// `data_mut` holds that lock deadlocks the UI thread.
 fn app_icon_texture(ctx: &egui::Context) -> Arc<egui::TextureHandle> {
     let id = egui::Id::unique("md_viewer_app_icon_texture");
-    ctx.data_mut(|data| {
-        data.get_temp_mut_or_insert_with::<Arc<egui::TextureHandle>>(id, || {
-            let icon = eframe::icon_data::from_png_bytes(include_bytes!(
-                "../assets/md-viewer-256.png"
-            ))
-            .expect("the bundled app icon must be a valid PNG");
-            Arc::new(ctx.load_texture(
-                "md-viewer-icon",
-                egui::ColorImage::from_rgba_unmultiplied(
-                    [icon.width as usize, icon.height as usize],
-                    &icon.rgba,
-                ),
-                egui::TextureOptions::LINEAR,
-            ))
-        })
-        .clone()
-    })
+    if let Some(texture) = ctx.data_mut(|data| data.get_temp::<Arc<egui::TextureHandle>>(id)) {
+        return texture;
+    }
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/md-viewer-256.png"))
+        .expect("the bundled app icon must be a valid PNG");
+    let texture = Arc::new(ctx.load_texture(
+        "md-viewer-icon",
+        egui::ColorImage::from_rgba_unmultiplied(
+            [icon.width as usize, icon.height as usize],
+            &icon.rgba,
+        ),
+        egui::TextureOptions::LINEAR,
+    ));
+    ctx.data_mut(|data| data.insert_temp(id, texture.clone()));
+    texture
 }
 
 /// Draws a 1 px horizontal rule across the available width.
@@ -7857,6 +7853,113 @@ mod tab_tests {
         app.close_tab(0);
         assert_eq!(app.tabs.len(), 1);
         assert!(!app.tab_bar_visible());
+    }
+
+    /// Finds the center of the first text shape containing `needle`.
+    fn find_text_center(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<egui::Pos2> {
+        fn walk(shape: &egui::Shape, needle: &str, out: &mut Option<egui::Pos2>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    if out.is_none() && text.galley.text().contains(needle) {
+                        *out = Some(text.pos + text.galley.size() / 2.0);
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, needle, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = None;
+        for clipped in shapes {
+            walk(&clipped.shape, needle, &mut out);
+        }
+        out
+    }
+
+    /// Collects every painted text run.
+    fn all_text(shapes: &[egui::epaint::ClippedShape]) -> String {
+        fn walk(shape: &egui::Shape, out: &mut String) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push_str(text.galley.text());
+                    out.push('\n');
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = String::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    /// Clicking the toolbar's About button must open the About panel, and the
+    /// panel must stay open (it is a modal, not a one-frame flash).
+    #[test]
+    fn about_button_opens_the_about_panel() {
+        fn run(ctx: &egui::Context, app: &mut App, raw: egui::RawInput) -> egui::FullOutput {
+            let mut out = ctx.run_ui(raw, |ui| {
+                app.toolbar(ui);
+                app.show_about_dialog(ui.ctx());
+            });
+            // The About icon allocates a texture; the deltas must be consumed.
+            out.textures_delta.clear();
+            out
+        }
+
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        let mut raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 860.0),
+            )),
+            ..Default::default()
+        };
+
+        // Frame 1: layout the toolbar and find the About button.
+        let out = run(&ctx, &mut app, raw.clone());
+        let pos = find_text_center(&out.shapes, "ⓘ")
+            .expect("the About button (ⓘ) must be painted in the toolbar");
+
+        // Frame 2: press on it. Frame 3: release (click).
+        raw.events.push(egui::Event::PointerMoved(pos));
+        raw.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        });
+        run(&ctx, &mut app, raw.clone());
+        raw.events.clear();
+        raw.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        });
+        let _release_frame = run(&ctx, &mut app, raw.clone());
+
+        assert!(app.about_dialog, "clicking ⓘ must open the About panel");
+        // Frame 4: the modal must be painted and stay open (no same-frame
+        // close, no one-frame flash).
+        let out = run(&ctx, &mut app, raw.clone());
+        assert!(app.about_dialog, "the About panel must stay open");
+        let painted = all_text(&out.shapes);
+        assert!(
+            painted.contains("Version") && painted.contains("Enhanced Markdown File Viewer"),
+            "the About panel must be painted:\n{painted}"
+        );
+        assert!(painted.contains("MIT License"));
     }
 
     #[test]
