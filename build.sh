@@ -129,7 +129,7 @@ Exec=$bin_dir/$APP_NAME %f
 TryExec=$bin_dir/$APP_NAME
 Icon=$APP_NAME
 Terminal=false
-Categories=Development;TextEditor;Utility;
+Categories=Utility;TextEditor;
 MimeType=text/markdown;text/x-markdown;
 StartupWMClass=$APP_NAME
 StartupNotify=true
@@ -189,7 +189,7 @@ Exec=$APP_NAME %f
 TryExec=$APP_NAME
 Icon=$APP_NAME
 Terminal=false
-Categories=Development;TextEditor;Utility;
+Categories=Utility;TextEditor;
 MimeType=text/markdown;text/x-markdown;
 StartupWMClass=$APP_NAME
 StartupNotify=true
@@ -209,7 +209,12 @@ for size in 512x512 256x256; do
   cp "share/icons/hicolor/\$size/apps/$APP_NAME.png" "\$data_dir/icons/hicolor/\$size/apps/"
 done
 cp bin/$APP_NAME "\$prefix/bin/"
-cp share/applications/$APP_NAME.desktop "\$data_dir/applications/"
+# Make Exec/TryExec absolute: ~/.local/bin is frequently not on the session
+# PATH, and GNOME hides menu entries whose TryExec cannot be resolved.
+sed -e "s|^Exec=$APP_NAME |Exec=\$prefix/bin/$APP_NAME |" \
+    -e "s|^TryExec=$APP_NAME\$|TryExec=\$prefix/bin/$APP_NAME|" \
+    "share/applications/$APP_NAME.desktop" \
+    > "\$data_dir/applications/$APP_NAME.desktop"
 [ -f "share/md-viewer/start-up.md" ] && cp "share/md-viewer/start-up.md" "\$data_dir/md-viewer/"
 command -v xdg-mime >/dev/null 2>&1 \
   && xdg-mime default $APP_NAME.desktop text/markdown || true
@@ -217,6 +222,8 @@ command -v xdg-mime >/dev/null 2>&1 \
   && xdg-mime default $APP_NAME.desktop text/x-markdown || true
 command -v update-desktop-database >/dev/null 2>&1 \
   && update-desktop-database "\$data_dir/applications" || true
+command -v gtk-update-icon-cache >/dev/null 2>&1 \
+  && gtk-update-icon-cache -f -t "\$data_dir/icons/hicolor" 2>/dev/null || true
 echo "Installed to \$prefix — start MD-Viewer from the application menu."
 INSTALLER
   chmod +x "$root/install.sh"
