@@ -52,6 +52,7 @@ uninstall() {
   rm -f "$data_dir/applications/$APP_NAME.desktop"
   rm -f "$data_dir/icons/hicolor/"{16x16,32x32,128x128,256x256,512x512}"/apps/$APP_NAME.png"
   rm -f "$data_dir/$APP_NAME/start-up.md"
+  rmdir "$data_dir/$APP_NAME" 2>/dev/null || true
   rm -f "$HOME/.local/share/md-viewer-startup.md"
   update-desktop-database "$data_dir/applications" 2>/dev/null || true
   echo "Uninstalled $DISPLAY_NAME from $HOME/.local"
