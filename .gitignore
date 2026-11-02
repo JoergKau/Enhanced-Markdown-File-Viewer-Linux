@@ -1,0 +1,38 @@
+# Published releases intentionally track a small, explicit tree
+# (see still-to-do.md). Whitelist what ships; ignore the rest.
+#
+# --- Local only: reference checkouts and samples ---
+/egui-main/
+/wgpu-trunk/
+/winit-master/
+/mdviewer-main/
+/MD examples/
+/Project-Brief.md
+/projekt-rules.md
+/new-bugs.md
+/still-to-do.md
+/how-to.md
+/schroedinger.psd
+/schroedinger.svg
+/schroedinger.png
+/icon.png
+/dist/
+
+# --- Build artifacts ---
+/target/
+Cargo.lock.bak
+
+# --- OS junk ---
+.DS_Store
+._*
+Thumbs.db
+
+# --- macOS remains from the old checkout ---
+*.icns
+*.iconset
+Info.plist
+
+# --- Editor ---
+.idea/
+.vscode/
+*.swp
