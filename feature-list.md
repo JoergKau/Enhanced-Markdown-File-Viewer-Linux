@@ -23,10 +23,17 @@ egui/eframe (wgpu → Vulkan), winit and pulldown-cmark.
 
 ## Editor & preview
 
-- Rendered preview by default; **Edit** (Ctrl+Shift+P) opens a resizable split
-  view with the source editor and live preview.
-- Click any preview block to jump to the matching source line; switching views
-  keeps the section you were reading or editing.
+- Rendered preview by default; **Edit** (Ctrl+Shift+P or the toolbar) switches
+  the whole window to a centered Markdown editor — no split pane.
+- The editor styles the source live: headings scale, bold/italic/strikethrough,
+  inline and fenced code, quotes, lists, task boxes, tables, links and math are
+  recognizable while every byte remains editable. Syntax punctuation is hidden
+  except on the caret's line (or selected lines), where it appears dimmed.
+- Fenced code collapses its fence lines into a rounded card with a language
+  label; inline code keeps its own background. Inactive table delimiter rows
+  disappear, and table headers render bold.
+- Double-click any preview block to open Edit mode at that source line;
+  switching views keeps the section you were reading or editing.
 - **Find & replace** (Ctrl+F, Ctrl+G/Ctrl+Shift+G) with match counter,
   next/previous and replace one/all.
 - **Outline sidebar** (Ctrl+Shift+O) listing headings; click one to jump to
@@ -91,7 +98,7 @@ egui/eframe (wgpu → Vulkan), winit and pulldown-cmark.
 - Rust 2024 · eframe/egui 0.37 · wgpu (Vulkan) · winit 0.30 ·
   pulldown-cmark 0.13 · Linux x86_64 (built against Ubuntu 26.04; runs on any
   desktop Linux with X11/Wayland and Vulkan).
-- 192 unit/integration tests plus an ignored deep render pass; zero build,
+- 200 unit/integration tests plus an ignored deep render pass; zero build,
   clippy and rustfmt warnings.
 - User-local desktop integration via `build.sh --install`
   (`~/.local/bin/md-viewer`, `.desktop` entry with MIME registration,

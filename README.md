@@ -3,11 +3,12 @@
 A native Markdown editor and viewer for Ubuntu Linux — written in Rust with
 **egui/eframe** (wgpu → Vulkan), **winit** and **pulldown-cmark**.
 
-Edit Markdown on the left, see a live preview on the right, and export the
-document as a PDF. The editor and preview are self-contained — no Node, no
-browser engine, no webview. PDF export uses the `weasyprint` CLI as its single,
-mandatory conversion step (no fallback writer), so it has to be installed once;
-the app shows an onboarding dialog with the exact command.
+Edit Markdown in a full-window editor that styles the source live, switch to
+the rendered preview with one key, and export the document as a PDF. The
+editor and preview are self-contained — no Node, no browser engine, no webview.
+PDF export uses the `weasyprint` CLI as its single, mandatory conversion step
+(no fallback writer), so it has to be installed once; the app shows an
+onboarding dialog with the exact command.
 
 ![Rust](https://img.shields.io/badge/Rust-2024-000?logo=rust)
 ![Platform](https://img.shields.io/badge/platform-Ubuntu%20x86_64-lightgrey)
@@ -47,7 +48,7 @@ See `build.sh` for an uninstall target (`./build.sh --uninstall`).
 
 - **Complete Markdown** — CommonMark + GFM, tables, task lists, footnotes, callouts, code highlighting and typeset LaTeX math.
 - **Obsidian & Pandoc** — wiki-links, `![[…]]` embeds, front matter, fenced divs, admonitions and `[TOC]`.
-- **Live preview & split editor** — click any preview block to jump to its source line; find & replace and an outline sidebar keep long documents navigable, and switching tabs restores the exact reading position.
+- **Live preview & rich editor** — **Edit** switches the whole window to a centered editor that styles headings, emphasis, code, quotes, lists and tables live while every byte stays editable. Double-click any preview block to open its source line; switching views keeps the section you were reading. Find & replace and an outline sidebar keep long documents navigable, and switching tabs restores the exact reading position.
 - **Print-quality PDF** — A4, running footer, clickable links, images, math and Mermaid via WeasyPrint.
 - **Native Ubuntu UI** — dark and Paper themes, Ubuntu Sans/Ubuntu Sans Mono, tabs, drag & drop, file-manager integration.
 - **Fast & self-contained** — Vulkan-accelerated rendering, virtualized large documents, GPU-texture-capped images and formulas, no browser engine.
@@ -166,7 +167,7 @@ cargo test
 cargo clippy --all-targets
 ```
 
-All tests must pass and there should be zero warnings. The 192 tests cover the
+All tests must pass and there should be zero warnings. The 200 tests cover the
 parser (including HTML block conversion and the extended compatibility
 corpus), the print-HTML renderer (preprocessors, sanitizer, template,
 math/Mermaid image embedding, escape/base64 helpers), the WeasyPrint runner
@@ -230,7 +231,7 @@ with any raster tool and overwrite the two `md-viewer-*.png` files.
 | Find & replace | Toolbar **Find**, Ctrl+F; Ctrl+G / Ctrl+Shift+G next/previous, Esc closes |
 | Outline | Toolbar **Outline**, Ctrl+Shift+O — click a heading to jump to that section |
 | Toggle dark / Paper theme | Toolbar sun/moon button at the right (sun = dark active, moon = Paper active) |
-| Switch view | Toolbar **Preview / Edit**, Ctrl+Shift+P — Edit shows raw text left and live preview right |
+| Switch view | Toolbar **Preview / Edit**, Ctrl+Shift+P — Edit is a full-window, live-styled Markdown editor; double-click a preview block to open its source line |
 | Zoom | Toolbar **A−/A+**, Ctrl+/Ctrl−; the percentage readout between them shows the current magnification and resets to 100% when clicked (also Ctrl+0) |
 | Inspect an image | Click an image in the preview; scroll to zoom, drag to pan, **Esc** (or **Close**) returns to the document |
 | Cut / copy / paste | Ctrl+X / Ctrl+C / Ctrl+V or right-click in the editor |
