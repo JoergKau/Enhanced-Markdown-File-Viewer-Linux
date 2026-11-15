@@ -466,6 +466,16 @@ struct MathTexture {
     size: Vec2,
 }
 
+/// Formulas longer than this are treated as mis-detected math and shown as
+/// styled source text instead of being typeset.
+///
+/// Real formulas are short. When plain prose contains two `$` characters
+/// (a C# interpolated string or stack trace, say) the parser produces one
+/// enormous "formula" from the text between them: typesetting it is slow and
+/// the raster can become wider than any GPU texture, which used to crash the
+/// wgpu backend (see new-bugs.md, silent crash while browsing).
+const MAX_FORMULA_CHARS: usize = 1_000;
+
 /// Lazy LaTeX renderer and texture cache.
 ///
 /// Uses `latex-rust` (pure Rust, embedded STIX Two Math font) with its PNG
@@ -513,6 +523,12 @@ impl MathCache {
 
     /// Parses/lays out/rasterizes one formula and uploads it as a texture.
     fn render(&mut self, ctx: &egui::Context, key: &MathKey) -> Option<MathTexture> {
+        // Guard against mis-detected math: prose between two `$` characters
+        // would otherwise be typeset into an enormous raster.
+        if key.tex.chars().count() > MAX_FORMULA_CHARS {
+            return None;
+        }
+
         let font = self
             .font
             .get_or_insert_with(|| latex_rust::MathFont::stix_two_math().ok())
@@ -532,6 +548,18 @@ impl MathCache {
         let rgba = image.to_rgba8();
         let width = rgba.width() as usize;
         let height = rgba.height() as usize;
+        // A typeset raster wider/taller than the GPU's texture limit would
+        // panic the wgpu backend (validation errors are fatal there).
+        let max_side = ctx.input(|i| i.max_texture_side);
+        if width > max_side || height > max_side {
+            log::warn!(
+                "typeset formula is {}x{} px, beyond the {} px texture limit; showing the source",
+                width,
+                height,
+                max_side
+            );
+            return None;
+        }
         let color_image = egui::ColorImage::from_rgba_unmultiplied([width, height], rgba.as_raw());
         let handle = ctx.load_texture(
             format!("latex:{}:{}:{}", key.size_cent, key.display, key.tex),
@@ -590,6 +618,14 @@ struct TabState {
     last_cursor: (usize, usize),
     preview_line: Option<usize>,
     preview_top_line: usize,
+    /// Exact vertical scroll offset of the preview, in points from the top.
+    /// Saved on every frame so switching tabs restores the reading position.
+    scroll_offset: f32,
+    /// Measured/estimated preview block heights for this document.
+    metrics: PreviewMetrics,
+    /// Bumped when this tab's document is (re)parsed. Keys [`TabState::metrics`]
+    /// so measured heights survive tab switches.
+    doc_revision: u64,
 }
 
 impl TabState {
@@ -607,6 +643,9 @@ impl TabState {
             last_cursor: (1, 1),
             preview_line: None,
             preview_top_line: 1,
+            scroll_offset: 0.0,
+            metrics: PreviewMetrics::default(),
+            doc_revision: 1,
         }
     }
 
@@ -796,7 +835,7 @@ struct PreviewKey {
 
 /// Measured/estimated heights of top-level preview blocks, used to render only
 /// the visible window of very large documents.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct PreviewMetrics {
     key: PreviewKey,
     heights: Vec<f32>,
@@ -871,8 +910,17 @@ pub struct App {
     math_cache: MathCache,
     /// Monotonic revision used to invalidate preview layout caches.
     preview_revision: u64,
+    /// Revision of the active tab's parsed document. Keys the preview metrics;
+    /// unlike [`App::preview_revision`] it does not change on tab switches.
+    doc_revision: u64,
     /// Cached heights for the virtualized preview.
     preview_metrics: PreviewMetrics,
+    /// Exact vertical scroll offset of the preview, in points. Updated every
+    /// frame and saved with the tab so switching back restores the position.
+    scroll_offset: f32,
+    /// Offset to force on the preview's ScrollArea on the next frame (tab
+    /// switch or freshly opened file). Consumed by [`preview_ui`].
+    restore_scroll: Option<f32>,
     /// Pending caret move for the source editor (Edit mode only), set by
     /// preview clicks, outline clicks and find reveals. Consumed by
     /// [`editor_ui`] on the next frame.
@@ -902,6 +950,11 @@ impl App {
     /// `initial` optionally opens a file passed on the command line.
     pub fn new(cc: &eframe::CreationContext, initial: Option<PathBuf>) -> Self {
         apply_theme(&cc.egui_ctx);
+        // Install the capping loader first: egui tries image loaders in order,
+        // and the stock loaders would hand oversized textures straight to the
+        // GPU (fatal wgpu validation error, see new-bugs.md).
+        cc.egui_ctx
+            .add_image_loader(Arc::new(CappedImageLoader::default()));
         install_image_loaders(&cc.egui_ctx);
         // Remote images are downloaded with the system `curl` (installed on
         // every Ubuntu desktop). This is deliberately not the `egui_extras`
@@ -954,7 +1007,10 @@ impl App {
             image_viewer: None,
             math_cache: MathCache::default(),
             preview_revision: 1,
+            doc_revision: 1,
             preview_metrics: PreviewMetrics::default(),
+            scroll_offset: 0.0,
+            restore_scroll: None,
             jump_line: None,
             preview_line: None,
             preview_top_line: 1,
@@ -995,6 +1051,9 @@ impl App {
             last_cursor: self.last_cursor,
             preview_line: self.preview_line,
             preview_top_line: self.preview_top_line,
+            scroll_offset: self.scroll_offset,
+            metrics: self.preview_metrics.clone(),
+            doc_revision: self.doc_revision,
         }
     }
 
@@ -1022,12 +1081,19 @@ impl App {
         self.cursor_key = None;
         // A caret move is only meant for the tab that requested it.
         self.jump_line = None;
-        // Restore the reading position: remember where the tab was left and
-        // scroll the preview there on the next frame.
-        self.preview_line = tab
-            .preview_line
-            .or_else(|| Some(tab.preview_top_line.max(1)));
+        // Restore the reading position exactly: the preview's ScrollArea is
+        // forced back to the tab's saved offset on the next frame. The scroll
+        // offset is per tab (the ScrollArea id is shared, so without the
+        // override the previous tab's position would leak in). A pending
+        // preview jump still takes precedence over the offset.
+        self.preview_line = tab.preview_line;
         self.preview_top_line = tab.preview_top_line;
+        self.scroll_offset = tab.scroll_offset;
+        self.restore_scroll = Some(tab.scroll_offset);
+        // Keep the measured preview heights; they are keyed by this tab's
+        // document revision and stay valid across switches.
+        self.preview_metrics = tab.metrics;
+        self.doc_revision = tab.doc_revision;
         self.preview_revision = self.preview_revision.wrapping_add(1);
         self.image_viewer = None;
     }
@@ -1146,6 +1212,10 @@ impl App {
                 self.jump_line = None;
                 self.preview_line = None;
                 self.preview_top_line = 1;
+                // A new document starts at the top (the shared ScrollArea id
+                // would otherwise resume the previous document's offset).
+                self.scroll_offset = 0.0;
+                self.restore_scroll = Some(0.0);
                 self.last_cursor = (1, 1);
                 self.reparse();
                 self.store_active();
@@ -1213,6 +1283,7 @@ impl App {
     fn reparse(&mut self) {
         self.doc = parser::parse(&self.text);
         self.preview_revision = self.preview_revision.wrapping_add(1);
+        self.doc_revision = self.doc_revision.wrapping_add(1);
         (self.line_count, self.word_count) = text_stats(&self.text);
     }
 
@@ -2189,6 +2260,9 @@ impl App {
                 let preview_top_line = &mut self.preview_top_line;
                 let preview_metrics = &mut self.preview_metrics;
                 let preview_revision = self.preview_revision;
+                let doc_revision = self.doc_revision;
+                let restore_scroll = &mut self.restore_scroll;
+                let scroll_offset = &mut self.scroll_offset;
                 let mut changed = false;
                 let mut new_fraction = self.split_fraction;
                 let mut image_click = None;
@@ -2271,7 +2345,9 @@ impl App {
                                         preview_line,
                                         preview_top_line,
                                         preview_metrics,
-                                        preview_revision,
+                                        doc_revision,
+                                        restore_scroll,
+                                        scroll_offset,
                                     );
                                 });
                                 ui.add_space(24.0);
@@ -2314,7 +2390,9 @@ impl App {
                     &mut self.preview_line,
                     &mut self.preview_top_line,
                     &mut self.preview_metrics,
-                    self.preview_revision,
+                    self.doc_revision,
+                    &mut self.restore_scroll,
+                    &mut self.scroll_offset,
                 );
                 if let Some(request) = image_click {
                     self.image_viewer = Some(ImageViewer::new(request));
@@ -3484,97 +3562,107 @@ fn preview_ui(
     preview_line: &mut Option<usize>,
     preview_top_line: &mut usize,
     metrics: &mut PreviewMetrics,
-    revision: u64,
+    doc_revision: u64,
+    restore_offset: &mut Option<f32>,
+    saved_offset: &mut f32,
 ) -> Option<usize> {
     let mut hits: Vec<SourceHit> = Vec::new();
     let virtualize = doc.blocks.len() > VIRTUALIZE_THRESHOLD;
 
-    let output = ScrollArea::vertical()
+    // Tab switches and freshly opened files force the exact saved offset; the
+    // ScrollArea id is shared between tabs, so without this the previous
+    // tab's (or document's) scroll position would leak in.
+    let mut area = ScrollArea::vertical()
         .id_salt("preview_scroll")
-        .auto_shrink([false; 2])
-        .show_viewport(ui, |ui, viewport| {
-            ui.add_space(24.0);
-            preview_column(ui, f, full_width, |ui| {
+        .auto_shrink([false; 2]);
+    if let Some(offset) = restore_offset.take() {
+        area = area.vertical_scroll_offset(offset);
+    }
+
+    let output = area.show_viewport(ui, |ui, viewport| {
+        ui.add_space(24.0);
+        preview_column(ui, f, full_width, |ui| {
+            if virtualize {
+                let width = ui.available_width().max(1.0);
+                let key = PreviewKey {
+                    revision: doc_revision,
+                    width: width.round() as u32,
+                    font: f.to_bits(),
+                    theme: theme::mode() as u8,
+                };
+                if metrics.key != key || metrics.heights.len() != doc.blocks.len() {
+                    metrics.key = key;
+                    metrics.heights = doc
+                        .blocks
+                        .iter()
+                        .map(|block| estimate_block_height(block, f, width))
+                        .collect();
+                }
+            }
+
+            let before_front = ui.cursor().top();
+            render_front_matter(ui, doc, f);
+            let front_height = (ui.cursor().top() - before_front).max(0.0);
+            let mut y = 24.0 + front_height;
+
+            // Scroll to the block containing the requested source line. The
+            // virtual path needs the offset up front; the full path scrolls
+            // to the rendered block after the loop.
+            let target = preview_line.take();
+            if let Some(target) = target.filter(|_| virtualize) {
+                let index =
+                    preview_index_for_line(&doc.block_lines, target).min(metrics.heights.len() - 1);
+                let offset = 24.0 + front_height + metrics.heights[..index].iter().sum::<f32>();
+                let height = metrics.heights[index];
+                let screen_y = ui.clip_rect().top() + (offset - viewport.min.y);
+                ui.scroll_to_rect(
+                    Rect::from_min_size(
+                        egui::pos2(ui.clip_rect().left(), screen_y),
+                        Vec2::new(1.0, height),
+                    ),
+                    Some(Align::Min),
+                );
+            }
+
+            for (index, block) in doc.blocks.iter().enumerate() {
                 if virtualize {
-                    let width = ui.available_width().max(1.0);
-                    let key = PreviewKey {
-                        revision,
-                        width: width.round() as u32,
-                        font: f.to_bits(),
-                        theme: theme::mode() as u8,
-                    };
-                    if metrics.key != key || metrics.heights.len() != doc.blocks.len() {
-                        metrics.key = key;
-                        metrics.heights = doc
-                            .blocks
-                            .iter()
-                            .map(|block| estimate_block_height(block, f, width))
-                            .collect();
-                    }
-                }
-
-                let before_front = ui.cursor().top();
-                render_front_matter(ui, doc, f);
-                let front_height = (ui.cursor().top() - before_front).max(0.0);
-                let mut y = 24.0 + front_height;
-
-                // Scroll to the block containing the requested source line. The
-                // virtual path needs the offset up front; the full path scrolls
-                // to the rendered block after the loop.
-                let target = preview_line.take();
-                if let Some(target) = target.filter(|_| virtualize) {
-                    let index = preview_index_for_line(&doc.block_lines, target)
-                        .min(metrics.heights.len() - 1);
-                    let offset = 24.0 + front_height + metrics.heights[..index].iter().sum::<f32>();
                     let height = metrics.heights[index];
-                    let screen_y = ui.clip_rect().top() + (offset - viewport.min.y);
-                    ui.scroll_to_rect(
-                        Rect::from_min_size(
-                            egui::pos2(ui.clip_rect().left(), screen_y),
-                            Vec2::new(1.0, height),
-                        ),
-                        Some(Align::Min),
-                    );
-                }
-
-                for (index, block) in doc.blocks.iter().enumerate() {
-                    if virtualize {
-                        let height = metrics.heights[index];
-                        if y > viewport.max.y + PREVIEW_OVERSCAN {
-                            ui.add_space(metrics.heights[index..].iter().sum());
-                            break;
-                        }
-                        if y + height < viewport.min.y - PREVIEW_OVERSCAN {
-                            ui.add_space(height);
-                            y += height;
-                            continue;
-                        }
+                    if y > viewport.max.y + PREVIEW_OVERSCAN {
+                        ui.add_space(metrics.heights[index..].iter().sum());
+                        break;
                     }
-                    let rect =
-                        render_top_level(ui, index, block, f, base_dir, image_click, math_cache);
-                    if virtualize {
-                        metrics.heights[index] = rect.height();
-                        y += rect.height();
+                    if y + height < viewport.min.y - PREVIEW_OVERSCAN {
+                        ui.add_space(height);
+                        y += height;
+                        continue;
                     }
-                    hits.push((rect, doc.block_lines.get(index).copied().unwrap_or(1)));
                 }
+                let rect = render_top_level(ui, index, block, f, base_dir, image_click, math_cache);
+                if virtualize {
+                    metrics.heights[index] = rect.height();
+                    y += rect.height();
+                }
+                hits.push((rect, doc.block_lines.get(index).copied().unwrap_or(1)));
+            }
 
-                // Mode switch Editor → Preview: scroll to the block that
-                // contains the editor caret line (the last block starting at
-                // or before it).
-                if let Some(target) = target.filter(|_| !virtualize)
-                    && let Some((rect, _)) = block_at_line(&hits, target)
-                {
-                    ui.scroll_to_rect(rect, Some(Align::Min));
-                }
-                render_footnotes(ui, doc, f, base_dir, image_click, math_cache);
-                ui.add_space(72.0);
-            });
+            // Mode switch Editor → Preview: scroll to the block that
+            // contains the editor caret line (the last block starting at
+            // or before it).
+            if let Some(target) = target.filter(|_| !virtualize)
+                && let Some((rect, _)) = block_at_line(&hits, target)
+            {
+                ui.scroll_to_rect(rect, Some(Align::Min));
+            }
+            render_footnotes(ui, doc, f, base_dir, image_click, math_cache);
+            ui.add_space(72.0);
         });
+    });
 
     if let Some(line) = top_visible_line(&hits, output.inner_rect) {
         *preview_top_line = line;
     }
+    // Remember the exact scroll position so a tab switch can restore it.
+    *saved_offset = output.state.clamped_offset().y;
 
     // Click in the preview → the source line the caller should jump to.
     if ui.input(|i| i.pointer.primary_clicked())
@@ -6195,6 +6283,11 @@ const MAX_REMOTE_DIMENSION: u32 = 12_000;
 /// Maximum pixel count of a remote raster image (~40 MP).
 const MAX_REMOTE_PIXELS: u64 = 40_000_000;
 
+/// Refuses to decode rasters beyond this many pixels: a decompression-bomb
+/// guard that applies to local files as well. Anything under it is
+/// downscaled to the GPU texture limit, so the extra detail is invisible.
+const MAX_DECODE_PIXELS: u64 = 128_000_000;
+
 /// Rejects image bytes that are too large to load safely: the byte size, and
 /// the pixel size of raster images. SVG sizes are checked by [`svg_size_error`].
 fn check_download_limits(bytes: &[u8]) -> Result<(), String> {
@@ -6259,6 +6352,152 @@ fn sniff_mime(bytes: &[u8]) -> Option<&'static str> {
 }
 
 type SvgCache = Mutex<HashMap<(String, SizeHint), Result<Arc<egui::ColorImage>, String>>>;
+
+/// Decoded-image cache for [`CappedImageLoader`], keyed by URI and size hint.
+type CappedImageCache = Mutex<HashMap<(String, SizeHint), Result<Arc<egui::ColorImage>, String>>>;
+
+/// Image loader that keeps every texture within the GPU size limit.
+///
+/// `egui_extras`' loaders hand decoded images to egui unchecked: a photo or
+/// an SVG rasterized wider than `max_texture_side` made the wgpu backend
+/// panic with a texture validation error, silently closing the app (see
+/// new-bugs.md). This loader is installed before the stock loaders, decodes
+/// the bytes itself and caps the result: rasters are downscaled to the
+/// device limit, SVGs are rasterized (same `resvg` backend as
+/// [`SvgSniffLoader`]) at a fitting size, and absurd rasters are refused
+/// before their pixels are decoded. Payloads it cannot decode fall through
+/// to the stock loaders unchanged.
+#[derive(Default)]
+struct CappedImageLoader {
+    cache: CappedImageCache,
+}
+
+impl ImageLoader for CappedImageLoader {
+    fn id(&self) -> &str {
+        "md_viewer::ui::CappedImageLoader"
+    }
+
+    fn load(&self, ctx: &egui::Context, uri: &str, size_hint: SizeHint) -> ImageLoadResult {
+        let key = (uri.to_owned(), size_hint);
+        if let Some(cached) = self.cache.lock().ok().and_then(|c| c.get(&key).cloned()) {
+            return match cached {
+                Ok(image) => Ok(ImagePoll::Ready { image }),
+                Err(err) => Err(LoadError::Loading(err)),
+            };
+        }
+
+        match ctx.try_load_bytes(uri) {
+            Ok(BytesPoll::Pending { size }) => Ok(ImagePoll::Pending { size }),
+            Ok(BytesPoll::Ready { bytes, .. }) => {
+                let result = decode_capped_image(ctx, &bytes, size_hint);
+                if let Ok(mut cache) = self.cache.lock() {
+                    cache.insert(key, result.clone());
+                }
+                match result {
+                    Ok(image) => Ok(ImagePoll::Ready { image }),
+                    Err(err) => Err(LoadError::Loading(err)),
+                }
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn forget(&self, uri: &str) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.retain(|(cached_uri, _), _| cached_uri != uri);
+        }
+    }
+
+    fn forget_all(&self) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.clear();
+        }
+    }
+
+    fn byte_size(&self) -> usize {
+        self.cache
+            .lock()
+            .map(|cache| {
+                cache
+                    .values()
+                    .filter_map(|r| r.as_ref().ok())
+                    .map(|image| image.pixels.len() * std::mem::size_of::<Color32>())
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+}
+
+/// Decodes image bytes into a texture that fits the GPU's size limit.
+///
+/// Oversized rasters are downscaled, oversized SVGs are rasterized again at
+/// a fitting size, and decode bombs are refused before any pixel is read.
+fn decode_capped_image(
+    ctx: &egui::Context,
+    bytes: &[u8],
+    size_hint: SizeHint,
+) -> Result<Arc<egui::ColorImage>, String> {
+    let max_side = ctx.input(|i| i.max_texture_side).max(1) as f32;
+
+    if looks_like_svg(bytes) {
+        if let Some(error) = svg_size_error(bytes) {
+            return Err(error);
+        }
+        let image =
+            egui_extras::image::load_svg_bytes_with_size(bytes, size_hint, &crate::svg::options())?;
+        let (width, height) = (image.width() as f32, image.height() as f32);
+        let longer = width.max(height).max(1.0);
+        if longer <= max_side {
+            return Ok(Arc::new(image));
+        }
+        // Too large for the GPU: rasterize again at an explicit, capped size.
+        // Round the box up so `maintain_aspect_ratio` treats the long side as
+        // the constraint (a rounded-down short side would shrink the width).
+        let scale = max_side / longer;
+        let width = ((width * scale).floor().max(1.0) as u32).min(max_side as u32);
+        let height = ((height * scale).ceil().max(1.0) as u32).min(max_side as u32);
+        let capped = egui_extras::image::load_svg_bytes_with_size(
+            bytes,
+            SizeHint::Size {
+                width,
+                height,
+                maintain_aspect_ratio: true,
+            },
+            &crate::svg::options(),
+        )?;
+        return Ok(Arc::new(capped));
+    }
+
+    if let Some((width, height)) = raster_dimensions(bytes) {
+        let pixels = u64::from(width) * u64::from(height);
+        if pixels > MAX_DECODE_PIXELS {
+            return Err(format!(
+                "image is {width}×{height} px ({} megapixels); the limit is {} megapixels",
+                pixels / 1_000_000,
+                MAX_DECODE_PIXELS / 1_000_000
+            ));
+        }
+    }
+
+    let decoded = image::load_from_memory(bytes).map_err(|err| err.to_string())?;
+    let (width, height) = (decoded.width(), decoded.height());
+    let longer = width.max(height) as f32;
+    let decoded = if longer > max_side {
+        // A square box keeps the aspect ratio: only the long side hits the cap.
+        decoded.resize(
+            max_side as u32,
+            max_side as u32,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        decoded
+    };
+    let rgba = decoded.to_rgba8();
+    Ok(Arc::new(egui::ColorImage::from_rgba_unmultiplied(
+        [rgba.width() as usize, rgba.height() as usize],
+        rgba.as_raw(),
+    )))
+}
 
 /// Image loader that rasterizes SVG responses whose URL has no `.svg`
 /// suffix (e.g. `https://img.shields.io/badge/Rust-2024`).
@@ -7559,6 +7798,8 @@ mod render_smoke_tests {
         let mut preview_line = None;
         let mut preview_top_line = 1usize;
         let mut metrics = PreviewMetrics::default();
+        let mut restore_scroll = None;
+        let mut scroll_offset = 0.0f32;
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -7582,6 +7823,8 @@ mod render_smoke_tests {
                     &mut preview_top_line,
                     &mut metrics,
                     0,
+                    &mut restore_scroll,
+                    &mut scroll_offset,
                 );
             });
         });
@@ -7807,7 +8050,10 @@ mod tab_tests {
             image_viewer: None,
             math_cache: MathCache::default(),
             preview_revision: 1,
+            doc_revision: 1,
             preview_metrics: PreviewMetrics::default(),
+            scroll_offset: 0.0,
+            restore_scroll: None,
             jump_line: None,
             preview_line: None,
             preview_top_line: 1,
@@ -8598,6 +8844,8 @@ mod jump_tests {
         let mut preview_line = None;
         let mut preview_top_line = 1usize;
         let mut preview_metrics = PreviewMetrics::default();
+        let mut restore_scroll = None;
+        let mut scroll_offset = 0.0f32;
 
         // Frame 1: press. Frame 2: release → egui reports `primary_clicked`.
         for pressed in [true, false] {
@@ -8626,6 +8874,8 @@ mod jump_tests {
                         &mut preview_top_line,
                         &mut preview_metrics,
                         0,
+                        &mut restore_scroll,
+                        &mut scroll_offset,
                     ) {
                         source_jump = Some(line);
                     }
@@ -8719,5 +8969,345 @@ mod zoom_tests {
         assert_eq!(magnification_percent(DEFAULT_FONT_SIZE * 2.0), 200.0);
         assert_eq!(magnification_percent(MIN_FONT_SIZE), 56.0);
         assert_eq!(magnification_percent(MAX_FONT_SIZE), 225.0);
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+
+    /// Wheel input over the middle of a 1200×850 window.
+    ///
+    /// egui's content-move convention: a negative `delta.y` scrolls the
+    /// viewport deeper into the document.
+    fn wheel_input(frame: usize, scroll: f32) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(1200.0, 850.0),
+            )),
+            events: {
+                let mut events = vec![egui::Event::PointerMoved(egui::Pos2::new(600.0, 400.0))];
+                if scroll != 0.0 {
+                    events.push(egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: Vec2::new(0.0, -scroll),
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Wheel,
+                        modifiers: Default::default(),
+                    });
+                }
+                events
+            },
+            time: Some(frame as f64 / 60.0),
+            ..Default::default()
+        }
+    }
+
+    /// A headless context with the app theme and system fonts installed.
+    fn test_context() -> egui::Context {
+        theme::set_mode(theme::Mode::Dark);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        install_system_fonts(&ctx);
+        ctx
+    }
+
+    /// A document with `sections` heading+paragraph sections.
+    fn generated_document(sections: usize) -> Document {
+        let mut markdown = String::new();
+        for i in 0..sections {
+            markdown.push_str(&format!(
+                "## Heading {i}\n\nParagraph {i} with enough text to give the block a stable height.\n\n"
+            ));
+        }
+        parser::parse(&markdown)
+    }
+
+    /// Per-tab preview state for the harness: the fields [`App`] keeps for the
+    /// active tab and [`TabState`] saves.
+    #[derive(Default)]
+    struct PreviewTab {
+        preview_line: Option<usize>,
+        preview_top_line: usize,
+        scroll_offset: f32,
+        metrics: PreviewMetrics,
+        restore_scroll: Option<f32>,
+        image_click: Option<ImageRequest>,
+        math_cache: MathCache,
+    }
+
+    impl PreviewTab {
+        /// Renders one preview frame, saving the scroll offset like the real
+        /// app does on every frame.
+        fn frame(&mut self, ctx: &egui::Context, doc: &Document, scroll: f32, frame_no: usize) {
+            let mut output = ctx.run_ui(wheel_input(frame_no, scroll), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    preview_ui(
+                        ui,
+                        doc,
+                        16.0,
+                        None,
+                        true,
+                        &mut self.image_click,
+                        &mut self.math_cache,
+                        &mut self.preview_line,
+                        &mut self.preview_top_line,
+                        &mut self.metrics,
+                        1,
+                        &mut self.restore_scroll,
+                        &mut self.scroll_offset,
+                    );
+                });
+            });
+            output.shapes.clear();
+            output.textures_delta.clear();
+        }
+    }
+
+    /// Sanity check for the wheel-input helper: a bare ScrollArea scrolls.
+    #[test]
+    fn plain_scroll_area_wheels_headlessly() {
+        let ctx = test_context();
+        let mut offset = 0.0;
+        for frame in 0..20 {
+            let mut output = ctx.run_ui(wheel_input(frame, 240.0), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let area =
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false; 2])
+                            .show(ui, |ui| {
+                                ui.add_space(5_000.0);
+                            });
+                    offset = area.state.clamped_offset().y;
+                });
+            });
+            output.shapes.clear();
+            output.textures_delta.clear();
+        }
+        assert!(offset > 0.0, "a plain ScrollArea should respond to wheels");
+    }
+
+    /// The preview must scroll on wheel input (small, non-virtualized document).
+    #[test]
+    fn preview_scrolls_small_document_headlessly() {
+        let ctx = test_context();
+        let doc = generated_document(100);
+        let mut tab = PreviewTab::default();
+        for frame in 0..60 {
+            tab.frame(&ctx, &doc, 240.0, frame);
+        }
+        assert!(
+            tab.preview_top_line > 10,
+            "preview did not scroll: top line {}",
+            tab.preview_top_line
+        );
+        assert!(tab.scroll_offset > 0.0);
+    }
+
+    /// The virtualized path (large documents) must scroll too, without
+    /// panicking while blocks are measured and rendered on the fly.
+    #[test]
+    fn preview_scrolls_virtualized_document_headlessly() {
+        let ctx = test_context();
+        let doc = generated_document(300);
+        assert!(doc.blocks.len() > VIRTUALIZE_THRESHOLD);
+        let mut tab = PreviewTab::default();
+        for frame in 0..80 {
+            tab.frame(&ctx, &doc, 600.0, frame);
+        }
+        assert!(
+            tab.preview_top_line > 50,
+            "virtualized preview did not scroll: top line {}",
+            tab.preview_top_line
+        );
+        assert!(tab.scroll_offset > 0.0);
+        assert_eq!(tab.metrics.heights.len(), doc.blocks.len());
+    }
+
+    /// Switching tabs must restore each tab's exact scroll offset. The
+    /// ScrollArea id is shared between tabs, so [`preview_ui`] needs the
+    /// explicit override that [`App::load_tab`] requests.
+    #[test]
+    fn tab_switch_preserves_preview_offset_and_position() {
+        let ctx = test_context();
+        let big_doc = generated_document(300);
+        let small_doc = parser::parse("# Small\n\nbody text\n");
+        let mut big = PreviewTab::default();
+        let mut small = PreviewTab::default();
+
+        // Scroll deep into the big (virtualized) document.
+        for frame in 0..80 {
+            big.frame(&ctx, &big_doc, 600.0, frame);
+        }
+        let saved_offset = big.scroll_offset;
+        let saved_top = big.preview_top_line;
+        assert!(saved_offset > 0.0, "the big document did not scroll");
+        assert!(
+            saved_top > 50,
+            "expected to be deep in the document, at line {saved_top}"
+        );
+
+        // Switch to the small tab and back. `App::load_tab` copies the saved
+        // offset into `restore_scroll`; the shared ScrollArea id would
+        // otherwise leave the small tab's offset in place.
+        big.restore_scroll = Some(big.scroll_offset);
+        small.restore_scroll = Some(small.scroll_offset);
+        small.frame(&ctx, &small_doc, 0.0, 100);
+        big.frame(&ctx, &big_doc, 0.0, 101);
+
+        assert!(
+            (big.scroll_offset - saved_offset).abs() < 1.0,
+            "scroll offset changed across a tab switch: {saved_offset} -> {}",
+            big.scroll_offset
+        );
+        assert_eq!(
+            big.preview_top_line, saved_top,
+            "reading position lost after switching tabs"
+        );
+    }
+
+    /// Prose between two `$` characters parses as one giant inline formula
+    /// (this is what happened in the crashing document). Even when it is
+    /// short enough for the length cap, typesetting it produces a raster
+    /// wider than any GPU texture, so it must fall back to source text.
+    #[test]
+    fn prose_between_dollars_falls_back_to_source() {
+        let prose = "The quick brown fox jumps over the lazy dog. ".repeat(15);
+        assert!(prose.chars().count() > 500 && prose.chars().count() <= MAX_FORMULA_CHARS);
+        // No space adjacent to either `$`, like the interpolated strings in
+        // the crashing document (a space there would stop the math parser).
+        let markdown = format!("Throw new Error(${}$);\n", prose.trim_end());
+        let doc = parser::parse(&markdown);
+        let mut math: Option<String> = None;
+        for block in &doc.blocks {
+            if let parser::Block::Paragraph(inlines) = block {
+                for inline in inlines {
+                    if let parser::Inline::Math { tex, .. } = inline {
+                        math = Some(tex.clone());
+                    }
+                }
+            }
+        }
+        let tex = math.expect("the paragraph with two `$` signs should produce inline math");
+
+        // Reproduce the app's raster settings (Retina pixels-per-point and
+        // the default font size): the typeset bitmap is many thousands of
+        // pixels wide.
+        let font = latex_rust::MathFont::stix_two_math().expect("STIX font");
+        let mut options = latex_rust::PngOptions::new();
+        options.font_size_pt = latex_rust::Dim::from_i64(16);
+        options.dpi = latex_rust::Dim::from_i64(144);
+        let png = latex_rust::latex_to_png(&tex, &font, &options)
+            .expect("prose should typeset as a very wide formula");
+        let raster = image::load_from_memory_with_format(&png, image::ImageFormat::Png).unwrap();
+        assert!(
+            raster.width() > 8192,
+            "test formula is not wide enough ({} px)",
+            raster.width()
+        );
+
+        let ctx = test_context();
+        ctx.set_pixels_per_point(2.0);
+        let mut cache = MathCache::default();
+        assert!(
+            cache.texture(&ctx, &tex, 16.0, false).is_none(),
+            "oversized formula must fall back to source"
+        );
+    }
+
+    /// Very long runs are rejected before typesetting (they are almost always
+    /// mis-detected math) and shown as source text.
+    #[test]
+    fn long_math_runs_fall_back_to_source() {
+        let tex = "a+".repeat(MAX_FORMULA_CHARS);
+        assert!(tex.chars().count() > MAX_FORMULA_CHARS);
+        let ctx = test_context();
+        let mut cache = MathCache::default();
+        assert!(cache.texture(&ctx, &tex, 16.0, false).is_none());
+    }
+
+    /// A typesetting-valid formula that rasterizes wider than the texture
+    /// limit must be rejected as well (the length cap alone is not enough).
+    #[test]
+    fn formula_wider_than_texture_limit_falls_back_to_source() {
+        let tex = "m".repeat(600);
+        assert!(tex.chars().count() <= MAX_FORMULA_CHARS);
+
+        // Prove the test formula really is wider than the default 2048 px
+        // headless texture limit, so a passing cache check is meaningful.
+        let font = latex_rust::MathFont::stix_two_math().expect("STIX font");
+        let mut options = latex_rust::PngOptions::new();
+        options.font_size_pt = latex_rust::Dim::from_i64(16);
+        options.dpi = latex_rust::Dim::from_i64(72);
+        let png = latex_rust::latex_to_png(&tex, &font, &options).expect("typeset wide formula");
+        let image = image::load_from_memory_with_format(&png, image::ImageFormat::Png).unwrap();
+        assert!(
+            image.width() > 2048,
+            "test formula is not wide enough ({} px)",
+            image.width()
+        );
+
+        let ctx = test_context();
+        let mut cache = MathCache::default();
+        assert!(
+            cache.texture(&ctx, &tex, 16.0, false).is_none(),
+            "a formula wider than the texture limit must not be uploaded"
+        );
+        // Ordinary formulas still render.
+        assert!(cache.texture(&ctx, "x + 1", 16.0, false).is_some());
+    }
+
+    /// Raster images larger than the GPU texture limit are downscaled by
+    /// [`decode_capped_image`] instead of crashing the wgpu backend.
+    #[test]
+    fn oversized_raster_images_are_downscaled() {
+        let ctx = test_context();
+        let png = {
+            let image = image::RgbaImage::from_pixel(9_000, 40, image::Rgba([255, 255, 255, 255]));
+            let mut out = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image)
+                .write_to(&mut out, image::ImageFormat::Png)
+                .unwrap();
+            out.into_inner()
+        };
+        let decoded = decode_capped_image(&ctx, &png, SizeHint::default()).unwrap();
+        assert_eq!(decoded.width(), 2048, "the long side should be capped");
+        assert!(decoded.height() <= 10, "aspect ratio should be kept");
+    }
+
+    /// SVGs larger than the texture limit are re-rasterized at a fitting size.
+    #[test]
+    fn oversized_svg_images_are_capped() {
+        let ctx = test_context();
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="9000" height="100">
+            <rect width="9000" height="100" fill="#888888"/></svg>"##;
+        let decoded = decode_capped_image(&ctx, svg, SizeHint::default()).unwrap();
+        assert!(
+            (2000..=2048).contains(&decoded.width()),
+            "the long side should be capped, got {}",
+            decoded.width()
+        );
+        assert!(
+            (22..=24).contains(&decoded.height()),
+            "aspect ratio should be kept, got {}",
+            decoded.height()
+        );
+    }
+
+    /// Images that fit the limit pass through without resampling.
+    #[test]
+    fn small_images_pass_through_unchanged() {
+        let ctx = test_context();
+        let png = {
+            let image = image::RgbaImage::from_pixel(64, 64, image::Rgba([10, 20, 30, 255]));
+            let mut out = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image)
+                .write_to(&mut out, image::ImageFormat::Png)
+                .unwrap();
+            out.into_inner()
+        };
+        let decoded = decode_capped_image(&ctx, &png, SizeHint::default()).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (64, 64));
     }
 }
