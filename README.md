@@ -47,10 +47,10 @@ See `build.sh` for an uninstall target (`./build.sh --uninstall`).
 
 - **Complete Markdown** — CommonMark + GFM, tables, task lists, footnotes, callouts, code highlighting and typeset LaTeX math.
 - **Obsidian & Pandoc** — wiki-links, `![[…]]` embeds, front matter, fenced divs, admonitions and `[TOC]`.
-- **Live preview & split editor** — click any preview block to jump to its source line; find & replace and an outline sidebar keep long documents navigable.
+- **Live preview & split editor** — click any preview block to jump to its source line; find & replace and an outline sidebar keep long documents navigable, and switching tabs restores the exact reading position.
 - **Print-quality PDF** — A4, running footer, clickable links, images, math and Mermaid via WeasyPrint.
 - **Native Ubuntu UI** — dark and Paper themes, Ubuntu Sans/Ubuntu Sans Mono, tabs, drag & drop, file-manager integration.
-- **Fast & self-contained** — Vulkan-accelerated rendering, virtualized large documents, no browser engine.
+- **Fast & self-contained** — Vulkan-accelerated rendering, virtualized large documents, GPU-texture-capped images and formulas, no browser engine.
 - AI assisted by **GLM**.
 
 See [feature-list.md](feature-list.md) for a concise feature overview and the
@@ -166,7 +166,7 @@ cargo test
 cargo clippy --all-targets
 ```
 
-All tests must pass and there should be zero warnings. The 182 tests cover the
+All tests must pass and there should be zero warnings. The 192 tests cover the
 parser (including HTML block conversion and the extended compatibility
 corpus), the print-HTML renderer (preprocessors, sanitizer, template,
 math/Mermaid image embedding, escape/base64 helpers), the WeasyPrint runner

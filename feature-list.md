@@ -32,6 +32,8 @@ egui/eframe (wgpu → Vulkan), winit and pulldown-cmark.
 - **Outline sidebar** (Ctrl+Shift+O) listing headings; click one to jump to
   that section.
 - Multiple tabs with per-tab edits, scroll position and unsaved markers.
+  Switching tabs restores the exact preview scroll offset and the measured
+  block heights, so virtualized documents do not drift or re-estimate.
 - Zoom (Ctrl+/Ctrl−, Ctrl+0), picture viewer with pan/zoom, drag & drop.
 - Large documents are virtualized (visible window plus overscan) above 250
   top-level blocks.
@@ -44,6 +46,10 @@ egui/eframe (wgpu → Vulkan), winit and pulldown-cmark.
 - Remote images are fetched with `curl` (HTTP/HTTPS only, no loopback or
   link-local hosts, redirects restricted)
   and capped at 25 MB / 40 megapixels.
+- Every image and formula texture stays within the GPU's texture limit:
+  oversized rasters are downscaled, oversized SVGs are re-rasterized at a
+  fitting size, and mis-detected math falls back to styled source instead of
+  crashing the renderer.
 
 ## Files
 
@@ -85,7 +91,7 @@ egui/eframe (wgpu → Vulkan), winit and pulldown-cmark.
 - Rust 2024 · eframe/egui 0.37 · wgpu (Vulkan) · winit 0.30 ·
   pulldown-cmark 0.13 · Linux x86_64 (built against Ubuntu 26.04; runs on any
   desktop Linux with X11/Wayland and Vulkan).
-- 182 unit/integration tests plus an ignored deep render pass; zero build,
+- 192 unit/integration tests plus an ignored deep render pass; zero build,
   clippy and rustfmt warnings.
 - User-local desktop integration via `build.sh --install`
   (`~/.local/bin/md-viewer`, `.desktop` entry with MIME registration,
